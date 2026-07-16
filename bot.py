@@ -371,8 +371,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # -------------------- اجرای اصلی --------------------
 def main():
+    # ساخت Application با استفاده از Application.builder()
     application = Application.builder().token(TOKEN).build()
 
+    # اضافه کردن هندلرها
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.AUDIO, handle_audio))
@@ -381,6 +383,7 @@ def main():
 
     if ENV == "production" and WEBHOOK_URL:
         logging.info(f"Starting webhook on port {PORT}")
+        # شروع وب‌هوک
         application.run_webhook(
             listen="0.0.0.0",
             port=PORT,
@@ -389,6 +392,7 @@ def main():
         )
     else:
         logging.info("Starting polling (local development)")
+        # شروع پولینگ
         application.run_polling()
 
 if __name__ == "__main__":
