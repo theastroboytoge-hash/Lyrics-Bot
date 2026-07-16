@@ -4,14 +4,13 @@ import uuid
 import time
 import textwrap
 import tempfile
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 import lyricsgenius
 import requests
 from bs4 import BeautifulSoup
 from mutagen import File as MutagenFile
-import asyncio
-import sys
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -103,14 +102,19 @@ async def fetch_lyrics_and_genres(title, artist):
     if not lyrics:
         try:
             resp = requests.get(f"https://api.lyrics.ovh/v1/{artist}/{title}", timeout=10)
-            if resp.status_code == 200 and 'lyrics' in resp.json():
-                lyrics = clean_lyrics(resp.json()['lyrics'])
+            if resp.status_code == 200:
+                data = resp.json()
+                if 'lyrics' in data:
+                    lyrics = clean_lyrics(data['lyrics'])
         except Exception:
             pass
 
     if LASTFM_API_KEY:
         try:
-            r = requests.get(f"http://ws.audioscrobbler.com/2.0/?method=artist.gettoptags&artist={artist}&api_key={LASTFM_API_KEY}&format=json", timeout=8)
+            r = requests.get(
+                f"http://ws.audioscrobbler.com/2.0/?method=artist.gettoptags&artist={artist}&api_key={LASTFM_API_KEY}&format=json",
+                timeout=8
+            )
             if r.status_code == 200:
                 tags = r.json().get('toptags', {}).get('tag', [])
                 genres = [t['name'] for t in tags[:8]]
@@ -123,7 +127,7 @@ async def send_results_page(update_or_query, search_id, page):
     clean_old_cache()
     data = search_cache.get(search_id)
     if not data:
-        msg = "⏳ Session expired."
+        msg = "⏳ Session expired. Search again."
         if isinstance(update_or_query, Update):
             await update_or_query.message.reply_text(msg)
         else:
@@ -175,14 +179,14 @@ async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, que
         await update.message.reply_text("⚠️ Error occurred.")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🎵 Lyrics Bot ready!\nSend song or audio.")
+    await update.message.reply_text("🎵 Lyrics Bot ready!\nSend song name or audio file.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await perform_search(update, context, update.message.text.strip())
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     obj = update.message.audio or update.message.document
-    if not obj or (update.message.document and not update.message.document.mime_type.startswith('audio/')):
+    if not obj or (update.message.document and not (update.message.document.mime_type or "").startswith('audio/')):
         await update.message.reply_text("❌ Send valid audio file.")
         return
 
@@ -195,7 +199,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         meta = MutagenFile(path)
-        title = artist = None
+        title = artist = "Unknown"
         if meta and hasattr(meta, 'tags'):
             tags = meta.tags
             title = str(tags.get('TIT2') or tags.get('title') or os.path.splitext(file_name)[0])
@@ -216,12 +220,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = q.data.split('_')
 
     if parts[0] == 'select':
-        sid, sid2 = parts[1], parts[2]
+        sid, song_id = parts[1], parts[2]
         cache = search_cache.get(sid)
         if not cache:
             await q.edit_message_text("Session expired.")
             return
-        song = next((s for s in cache['songs'] if str(s['id']) == sid2), None)
+        song = next((s for s in cache['songs'] if str(s['id']) == song_id), None)
         if not song:
             await q.edit_message_text("Song not found.")
             return
@@ -229,14 +233,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"⏳ Fetching {song['title']}...")
         lyrics, genres = await fetch_lyrics_and_genres(song['title'], song['artist'])
 
-        text = f"📝 Lyrics for {song['title']}\n\n{lyrics or 'Not found.'}"
+        text = f"📝 Lyrics:\n{lyrics or 'Not found.'}"
         if genres:
             text += "\n\n🎶 Genres:\n" + "\n".join(f"• {g}" for g in genres)
 
         if len(text) > 4096:
             for chunk in split_text(text):
                 await context.bot.send_message(q.message.chat_id, chunk)
-            await q.edit_message_text("✅ Sent.")
+            await q.edit_message_text("✅ Lyrics sent.")
         else:
             await q.edit_message_text(text)
 
@@ -244,29 +248,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_results_page(q, parts[1], int(parts[2]))
 
 async def main():
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & \
-                                   filters.COMMAND, handle_message))
-    app.add_handler(MessageHandler(filters.AUDIO | filters.Document.AUDIO, handle_audio))
-    app.add_handler(CallbackQueryHandler(handle_callback))
+    application = Application.builder().token(TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & \
+                                           filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.AUDIO | filters.Document.AUDIO, handle_audio))
+    application.add_handler(CallbackQueryHandler(handle_callback))
 
     if WEBHOOK_URL:
-        await app.bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
-        await app.run_webhook(listen="0.0.0.0", port=PORT, url_path=TOKEN, drop_pending_updates=True)
+        await application.bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+        logging.info("Webhook set")
+        await application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=TOKEN,
+            drop_pending_updates=True
+        )
     else:
-        await app.run_polling(drop_pending_updates=True)
+        await application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except Exception as e:
-        logging.error(f"Fatal: {e}")
-    finally:
-        logging.info("Bot shutdown")
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.stop()
-        except:
-            pass
+    asyncio.run(main())
