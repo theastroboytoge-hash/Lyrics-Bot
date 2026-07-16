@@ -383,7 +383,8 @@ async def main():
     application = Application.builder().token(TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & \~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.TEXT & \
+                                           filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.AUDIO | filters.Document.AUDIO, handle_audio))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
