@@ -2,15 +2,17 @@ import os
 import logging
 import uuid
 import time
-import re
 import textwrap
 import tempfile
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram.error import TimedOut
 import lyricsgenius
 import requests
 from bs4 import BeautifulSoup
 from mutagen import File as MutagenFile
+import httpx
 
 # -------------------- تنظیمات پایه --------------------
 logging.basicConfig(level=logging.INFO)
@@ -23,7 +25,6 @@ PORT = int(os.environ.get("PORT", 8443))
 
 if not TOKEN:
     raise ValueError("TOKEN environment variable is required!")
-
 if not GENIUS_TOKEN:
     raise ValueError("GENIUS_TOKEN environment variable is required!")
 
@@ -35,10 +36,16 @@ if ENV == "production":
     else:
         logging.warning("RENDER_EXTERNAL_URL not set; webhook will not be used.")
 
-genius = lyricsgenius.Genius(GENIUS_TOKEN, timeout=10, retries=3)
+# تنظیم Genius با timeout بالاتر
+genius = lyricsgenius.Genius(
+    GENIUS_TOKEN,
+    timeout=15,
+    retries=3,
+    sleep_time=1
+)
 genius.verbose = False
 
-# کش با زمان انقضا (۳۰ دقیقه)
+# کش
 CACHE_TTL = 1800
 search_cache = {}
 
@@ -88,20 +95,24 @@ def split_text(text, max_len=4000):
         chunks.append(current_chunk)
     return chunks
 
-# -------------------- دریافت متن و ژانر --------------------
-async def fetch_lyrics_and_genres(title, artist, genius_url=None):
+# -------------------- دریافت متن و ژانر با retry --------------------
+async def fetch_lyrics_and_genres(title, artist, genius_url=None, retries=2):
     lyrics = None
     genres = []
 
-    # ۱. Genius search_song
-    try:
-        song = genius.search_song(title, artist)
-        if song and song.lyrics:
-            lyrics = clean_lyrics(song.lyrics)
-    except Exception as e:
-        logging.error(f"Genius search_song error: {e}")
+    for attempt in range(retries + 1):
+        try:
+            # ۱. Genius
+            song = genius.search_song(title, artist)
+            if song and song.lyrics:
+                lyrics = clean_lyrics(song.lyrics)
+                break
+        except Exception as e:
+            logging.warning(f"Genius attempt {attempt+1} failed: {e}")
+            if attempt == retries:
+                logging.error("Genius failed after retries")
+            await asyncio.sleep(1)
 
-    # ۲. Fallback با search
     if not lyrics:
         try:
             results = genius.search(title + " " + artist, per_page=1)
@@ -113,12 +124,12 @@ async def fetch_lyrics_and_genres(title, artist, genius_url=None):
                     if full_song and full_song.lyrics:
                         lyrics = clean_lyrics(full_song.lyrics)
         except Exception as e:
-            logging.error(f"Genius search fallback error: {e}")
+            logging.error(f"Genius fallback error: {e}")
 
     # ۳. Lyrics.ovh
     if not lyrics:
         try:
-            resp = requests.get(f"https://api.lyrics.ovh/v1/{artist}/{title}")
+            resp = requests.get(f"https://api.lyrics.ovh/v1/{artist}/{title}", timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
                 if 'lyrics' in data:
@@ -126,11 +137,11 @@ async def fetch_lyrics_and_genres(title, artist, genius_url=None):
         except Exception as e:
             logging.error(f"Lyrics.ovh error: {e}")
 
-    # ۴. Scrape Genius
+    # ۴. Scrape
     if not lyrics and genius_url:
         try:
             headers = {'User-Agent': 'Mozilla/5.0'}
-            page = requests.get(genius_url, headers=headers)
+            page = requests.get(genius_url, headers=headers, timeout=10)
             soup = BeautifulSoup(page.text, 'html.parser')
             lyrics_div = soup.find('div', class_='Lyrics__Container') or \
                          soup.find('div', class_='lyrics') or \
@@ -139,13 +150,13 @@ async def fetch_lyrics_and_genres(title, artist, genius_url=None):
                 text = lyrics_div.get_text(separator='\n')
                 lyrics = clean_lyrics(text)
         except Exception as e:
-            logging.error(f"Genius scrape error: {e}")
+            logging.error(f"Scrape error: {e}")
 
-    # ۵. ژانر از Last.fm
+    # ۵. Last.fm Genres
     if LASTFM_API_KEY:
         try:
             url = f"http://ws.audioscrobbler.com/2.0/?method=artist.gettoptags&artist={artist}&api_key={LASTFM_API_KEY}&format=json"
-            resp = requests.get(url)
+            resp = requests.get(url, timeout=8)
             if resp.status_code == 200:
                 data = resp.json()
                 tags = data.get('toptags', {}).get('tag', [])
@@ -156,17 +167,19 @@ async def fetch_lyrics_and_genres(title, artist, genius_url=None):
 
     return lyrics, genres[:5] if genres else []
 
-# -------------------- نمایش نتایج جستجو --------------------
+# -------------------- بقیه توابع (تغییرات جزئی) --------------------
 async def send_results_page(update_or_query, search_id, page):
     clean_old_cache()
     data = search_cache.get(search_id)
     if not data:
+        text = "⏳ Search session expired. Please search again."
         if isinstance(update_or_query, Update):
-            await update_or_query.message.reply_text("⏳ Search session expired. Please search again.", parse_mode=None)
+            await update_or_query.message.reply_text(text, parse_mode=None)
         else:
-            await update_or_query.edit_message_text("⏳ Search session expired. Please search again.", parse_mode=None)
+            await update_or_query.edit_message_text(text, parse_mode=None)
         return
 
+    # ... (بقیه کد send_results_page بدون تغییر)
     songs = data['songs']
     total = data['total']
     page_size = 5
@@ -197,7 +210,6 @@ async def send_results_page(update_or_query, search_id, page):
     else:
         await update_or_query.edit_message_text(text, reply_markup=reply_markup, parse_mode=None)
 
-# -------------------- تابع جستجوی عمومی --------------------
 async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query_text: str):
     clean_old_cache()
     if not query_text:
@@ -237,7 +249,7 @@ async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, que
         logging.error(e, exc_info=True)
         await update.message.reply_text("⚠️ An error occurred. Please try again later.", parse_mode=None)
 
-# -------------------- هندلرهای تلگرام --------------------
+# هندلرها (بدون تغییر اساسی)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🎵 Welcome to Lyrics & Genre Bot!\n\n"
@@ -254,6 +266,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await perform_search(update, context, query)
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ... (کد قبلی handle_audio بدون تغییر)
     audio = update.message.audio
     if not audio:
         document = update.message.document
@@ -374,10 +387,9 @@ async def main():
     application = Application.builder().token(TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & \
-                                           filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.TEXT & \~filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.AUDIO, handle_audio))
-    application.add_handler(MessageHandler(filters.Document.AUDIO, handle_audio))  # برای فایل‌های صوتی
+    application.add_handler(MessageHandler(filters.Document.AUDIO, handle_audio))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
     if ENV == "production" and WEBHOOK_URL:
@@ -391,5 +403,4 @@ async def main():
         await application.run_polling()
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
