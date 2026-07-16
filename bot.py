@@ -370,30 +370,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 # -------------------- اجرای اصلی --------------------
-def main():
-    # ساخت Application با استفاده از Application.builder()
-    application = Application.builder().token(TOKEN).build()
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters
 
-    # اضافه کردن هندلرها
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(MessageHandler(filters.AUDIO, handle_audio))
-    application.add_handler(MessageHandler(filters.Document.AUDIO, handle_audio))
-    application.add_handler(CallbackQueryHandler(handle_callback))
+def main():
+    updater = Updater(token=TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
+    dp.add_handler(MessageHandler(Filters.audio, handle_audio))
+    dp.add_handler(MessageHandler(Filters.document, handle_audio))
+    dp.add_handler(CallbackQueryHandler(handle_callback))
 
     if ENV == "production" and WEBHOOK_URL:
-        logging.info(f"Starting webhook on port {PORT}")
-        # شروع وب‌هوک
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=TOKEN,
-            webhook_url=WEBHOOK_URL
-        )
+        updater.start_webhook(listen="0.0.0.0", port=PORT, url_path=TOKEN, webhook_url=WEBHOOK_URL)
     else:
-        logging.info("Starting polling (local development)")
-        # شروع پولینگ
-        application.run_polling()
+        updater.start_polling()
+    
+    updater.idle()
 
 if __name__ == "__main__":
     main()
