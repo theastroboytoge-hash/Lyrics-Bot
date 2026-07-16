@@ -5,17 +5,19 @@ import time
 import textwrap
 import tempfile
 import asyncio
+import sys
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
-from telegram.error import TimedOut
 import lyricsgenius
 import requests
 from bs4 import BeautifulSoup
 from mutagen import File as MutagenFile
-import httpx
 
 # -------------------- تنظیمات پایه --------------------
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 TOKEN = os.environ.get("TOKEN")
 GENIUS_TOKEN = os.environ.get("GENIUS_TOKEN")
@@ -36,16 +38,16 @@ if ENV == "production":
     else:
         logging.warning("RENDER_EXTERNAL_URL not set; webhook will not be used.")
 
-# تنظیم Genius با timeout بالاتر
+# Genius با تنظیمات مقاوم
 genius = lyricsgenius.Genius(
     GENIUS_TOKEN,
-    timeout=15,
+    timeout=20,
     retries=3,
-    sleep_time=1
+    sleep_time=2,
+    remove_section_headers=True
 )
 genius.verbose = False
 
-# کش
 CACHE_TTL = 1800
 search_cache = {}
 
@@ -95,23 +97,18 @@ def split_text(text, max_len=4000):
         chunks.append(current_chunk)
     return chunks
 
-# -------------------- دریافت متن و ژانر با retry --------------------
-async def fetch_lyrics_and_genres(title, artist, genius_url=None, retries=2):
+# -------------------- fetch با retry قوی --------------------
+async def fetch_lyrics_and_genres(title, artist, genius_url=None):
     lyrics = None
     genres = []
 
-    for attempt in range(retries + 1):
-        try:
-            # ۱. Genius
-            song = genius.search_song(title, artist)
-            if song and song.lyrics:
-                lyrics = clean_lyrics(song.lyrics)
-                break
-        except Exception as e:
-            logging.warning(f"Genius attempt {attempt+1} failed: {e}")
-            if attempt == retries:
-                logging.error("Genius failed after retries")
-            await asyncio.sleep(1)
+    # Genius
+    try:
+        song = genius.search_song(title, artist)
+        if song and song.lyrics:
+            lyrics = clean_lyrics(song.lyrics)
+    except Exception as e:
+        logging.error(f"Genius search_song error: {e}")
 
     if not lyrics:
         try:
@@ -126,10 +123,10 @@ async def fetch_lyrics_and_genres(title, artist, genius_url=None, retries=2):
         except Exception as e:
             logging.error(f"Genius fallback error: {e}")
 
-    # ۳. Lyrics.ovh
+    # Lyrics.ovh
     if not lyrics:
         try:
-            resp = requests.get(f"https://api.lyrics.ovh/v1/{artist}/{title}", timeout=10)
+            resp = requests.get(f"https://api.lyrics.ovh/v1/{artist}/{title}", timeout=12)
             if resp.status_code == 200:
                 data = resp.json()
                 if 'lyrics' in data:
@@ -137,11 +134,11 @@ async def fetch_lyrics_and_genres(title, artist, genius_url=None, retries=2):
         except Exception as e:
             logging.error(f"Lyrics.ovh error: {e}")
 
-    # ۴. Scrape
+    # Scrape Genius
     if not lyrics and genius_url:
         try:
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            page = requests.get(genius_url, headers=headers, timeout=10)
+            headers = {'User-Agent': 'Mozilla/5.0 (compatible; LyricsBot/1.0)'}
+            page = requests.get(genius_url, headers=headers, timeout=12)
             soup = BeautifulSoup(page.text, 'html.parser')
             lyrics_div = soup.find('div', class_='Lyrics__Container') or \
                          soup.find('div', class_='lyrics') or \
@@ -150,36 +147,35 @@ async def fetch_lyrics_and_genres(title, artist, genius_url=None, retries=2):
                 text = lyrics_div.get_text(separator='\n')
                 lyrics = clean_lyrics(text)
         except Exception as e:
-            logging.error(f"Scrape error: {e}")
+            logging.error(f"Genius scrape error: {e}")
 
-    # ۵. Last.fm Genres
+    # Genres
     if LASTFM_API_KEY:
         try:
             url = f"http://ws.audioscrobbler.com/2.0/?method=artist.gettoptags&artist={artist}&api_key={LASTFM_API_KEY}&format=json"
-            resp = requests.get(url, timeout=8)
+            resp = requests.get(url, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
                 tags = data.get('toptags', {}).get('tag', [])
                 if tags:
-                    genres = [tag['name'] for tag in tags[:10]]
+                    genres = [tag['name'] for tag in tags[:8]]
         except Exception as e:
             logging.error(f"Last.fm error: {e}")
 
     return lyrics, genres[:5] if genres else []
 
-# -------------------- بقیه توابع (تغییرات جزئی) --------------------
-async def send_results_page(update_or_query, search_id, page):
+# -------------------- send results --------------------
+async def send_results_page(update_or_query, search_id: str, page: int):
     clean_old_cache()
     data = search_cache.get(search_id)
     if not data:
-        text = "⏳ Search session expired. Please search again."
+        msg = "⏳ Search session expired. Please search again."
         if isinstance(update_or_query, Update):
-            await update_or_query.message.reply_text(text, parse_mode=None)
+            await update_or_query.message.reply_text(msg)
         else:
-            await update_or_query.edit_message_text(text, parse_mode=None)
+            await update_or_query.edit_message_text(msg)
         return
 
-    # ... (بقیه کد send_results_page بدون تغییر)
     songs = data['songs']
     total = data['total']
     page_size = 5
@@ -188,27 +184,22 @@ async def send_results_page(update_or_query, search_id, page):
     page_songs = songs[start:end]
     total_pages = (total + page_size - 1) // page_size
 
-    keyboard = []
-    for song in page_songs:
-        button_text = f"{song['title']} - {song['artist']}"
-        callback_data = f"select_{search_id}_{song['id']}"
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
+    keyboard = [[InlineKeyboardButton(f"{s['title']} - {s['artist']}", callback_data=f"select_{search_id}_{s['id']}")] for s in page_songs]
 
-    nav_buttons = []
+    nav = []
     if page > 0:
-        nav_buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"page_{search_id}_{page-1}"))
-    nav_buttons.append(InlineKeyboardButton(f"Page {page+1}/{total_pages}", callback_data="ignore"))
+        nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"page_{search_id}_{page-1}"))
+    nav.append(InlineKeyboardButton(f"Page {page+1}/{total_pages}", callback_data="ignore"))
     if end < total:
-        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"page_{search_id}_{page+1}"))
-    keyboard.append(nav_buttons)
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"page_{search_id}_{page+1}"))
+    keyboard.append(nav)
 
     reply_markup = InlineKeyboardMarkup(keyboard)
-    text = "🔍 Search results:"
 
-    if isinstance(update_or_query, Update) and update_or_query.message:
-        await update_or_query.message.reply_text(text, reply_markup=reply_markup, parse_mode=None)
+    if isinstance(update_or_query, Update):
+        await update_or_query.message.reply_text("🔍 Search results:", reply_markup=reply_markup)
     else:
-        await update_or_query.edit_message_text(text, reply_markup=reply_markup, parse_mode=None)
+        await update_or_query.edit_message_text("🔍 Search results:", reply_markup=reply_markup)
 
 async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query_text: str):
     clean_old_cache()
@@ -216,15 +207,15 @@ async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, que
         return
 
     try:
-        search_results = genius.search(query_text, per_page=10, page=1)
+        search_results = genius.search(query_text, per_page=10)
         hits = []
-        if 'sections' in search_results and len(search_results['sections']) > 0:
+        if 'sections' in search_results and search_results['sections']:
             hits = search_results['sections'][0].get('hits', [])
         if not hits and 'hits' in search_results:
             hits = search_results['hits']
 
         if not hits:
-            await update.message.reply_text("😕 No results found. Try a different query.", parse_mode=None)
+            await update.message.reply_text("😕 No results found.")
             return
 
         song_list = []
@@ -238,51 +229,35 @@ async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, que
             })
 
         search_id = generate_search_id()
-        search_cache[search_id] = {
-            'songs': song_list,
-            'total': len(song_list),
-            'timestamp': time.time()
-        }
+        search_cache[search_id] = {'songs': song_list, 'total': len(song_list), 'timestamp': time.time()}
         await send_results_page(update, search_id, 0)
 
     except Exception as e:
-        logging.error(e, exc_info=True)
-        await update.message.reply_text("⚠️ An error occurred. Please try again later.", parse_mode=None)
+        logging.error(f"Search error: {e}", exc_info=True)
+        await update.message.reply_text("⚠️ An error occurred. Please try again.")
 
-# هندلرها (بدون تغییر اساسی)
+# -------------------- Handlers --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🎵 Welcome to Lyrics & Genre Bot!\n\n"
-        "Send me a song name, artist name, or any part of the lyrics.\n"
-        "OR send me an audio file (MP3, M4A, etc.) and I'll extract its metadata and search for you!\n"
-        "Use the inline buttons to navigate through results.\n\n"
-        "Let's go!",
-        parse_mode=None
+        "Send song name / artist or lyrics snippet.\n"
+        "Or send an audio file!\n\nLet's go! 🎶"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.message.text.strip()
-    if query:
-        await perform_search(update, context, query)
+    if update.message.text:
+        await perform_search(update, context, update.message.text.strip())
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (کد قبلی handle_audio بدون تغییر)
-    audio = update.message.audio
+    audio = update.message.audio or (update.message.document if update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith('audio/') else None)
     if not audio:
-        document = update.message.document
-        if document and document.mime_type and document.mime_type.startswith('audio/'):
-            file_obj = document
-            file_name = document.file_name
-        else:
-            await update.message.reply_text("❌ Please send a valid audio file.", parse_mode=None)
-            return
-    else:
-        file_obj = audio
-        file_name = audio.file_name or "audio.mp3"
+        await update.message.reply_text("❌ Please send a valid audio file.")
+        return
 
-    file_id = file_obj.file_id
+    file_name = audio.file_name or "audio.mp3"
+    file_id = audio.file_id
     new_file = await context.bot.get_file(file_id)
-    
+
     suffix = os.path.splitext(file_name)[1] or '.mp3'
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
         temp_path = temp_file.name
@@ -290,36 +265,25 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         meta = MutagenFile(temp_path)
-        title = None
-        artist = None
+        title = artist = None
 
         if meta and hasattr(meta, 'tags'):
-            if 'TIT2' in meta.tags:
-                title = str(meta.tags['TIT2'])
-            elif 'title' in meta.tags:
-                title = str(meta.tags['title'])
-            if 'TPE1' in meta.tags:
-                artist = str(meta.tags['TPE1'])
-            elif 'artist' in meta.tags:
-                artist = str(meta.tags['artist'])
-            if not artist and 'TPE2' in meta.tags:
-                artist = str(meta.tags['TPE2'])
+            tags = meta.tags
+            title = str(tags.get('TIT2') or tags.get('title') or "")
+            artist = str(tags.get('TPE1') or tags.get('artist') or tags.get('TPE2') or "")
 
         if not title:
             title = os.path.splitext(file_name)[0]
         if not artist:
             artist = "Unknown Artist"
 
-        await update.message.reply_text(f"🎵 Extracted: {title} by {artist}", parse_mode=None)
-        query_text = f"{title} {artist}"
-        await perform_search(update, context, query_text)
+        await update.message.reply_text(f"🎵 Extracted: {title} by {artist}")
+        await perform_search(update, context, f"{title} {artist}")
 
     except Exception as e:
-        logging.error(f"Audio metadata extraction error: {e}")
-        await update.message.reply_text("⚠️ Could not read audio metadata. Trying with file name...", parse_mode=None)
-        title = os.path.splitext(file_name)[0]
-        await perform_search(update, context, title)
-
+        logging.error(f"Metadata error: {e}")
+        await update.message.reply_text("⚠️ Metadata read failed. Searching with filename...")
+        await perform_search(update, context, os.path.splitext(file_name)[0])
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
@@ -331,77 +295,56 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = data.split('_')
 
     if parts[0] == 'select':
-        search_id = parts[1]
-        song_id = parts[2]
-        clean_old_cache()
+        search_id, song_id = parts[1], parts[2]
         cache = search_cache.get(search_id)
         if not cache:
-            await query.edit_message_text("⏳ Search session expired. Please search again.", parse_mode=None)
+            await query.edit_message_text("⏳ Session expired.")
             return
 
         song = next((s for s in cache['songs'] if str(s['id']) == song_id), None)
         if not song:
-            await query.edit_message_text("❌ Song not found. Please search again.", parse_mode=None)
+            await query.edit_message_text("❌ Song not found.")
             return
 
-        await query.edit_message_text(f"⏳ Fetching lyrics and genres for {song['title']} by {song['artist']}...", parse_mode=None)
+        await query.edit_message_text(f"⏳ Fetching {song['title']} by {song['artist']}...")
 
         lyrics, genres = await fetch_lyrics_and_genres(song['title'], song['artist'], song['url'])
 
-        if not lyrics and not genres:
-            await query.edit_message_text("❌ No lyrics and no genres found for this song.", parse_mode=None)
-            return
-
-        chat_id = query.message.chat_id
-
-        response_text = ""
-        if lyrics:
-            response_text += f"📝 Lyrics:\n{lyrics}"
-        else:
-            response_text += "📝 Lyrics not found."
-
+        response = f"📝 Lyrics for {song['title']} - {song['artist']}\n\n"
+        response += lyrics if lyrics else "Lyrics not found."
         if genres:
-            genre_lines = "\n".join([f"• {g}" for g in genres[:5]])
-            response_text += f"\n\n🎶 Genres:\n{genre_lines}"
+            response += f"\n\n🎶 Genres:\n" + "\n".join(f"• {g}" for g in genres)
 
-        if len(response_text) > 4096:
-            chunks = split_text(response_text, 4000)
-            for i, chunk in enumerate(chunks):
-                if i == 0:
-                    await query.edit_message_text(chunk, parse_mode=None)
-                else:
-                    await context.bot.send_message(chat_id=chat_id, text=chunk, parse_mode=None)
+        if len(response) > 4096:
+            for chunk in split_text(response, 4000):
+                await query.message.reply_text(chunk) if response.index(chunk) == 0 else await context.bot.send_message(query.message.chat_id, chunk)
+            await query.edit_message_text("✅ Lyrics sent in parts.")
         else:
-            await query.edit_message_text(response_text, parse_mode=None)
+            await query.edit_message_text(response)
 
     elif parts[0] == 'page':
-        search_id = parts[1]
-        page = int(parts[2])
-        await send_results_page(query, search_id, page)
+        await send_results_page(query, parts[1], int(parts[2]))
 
-    elif data == 'ignore':
-        pass
-
-# -------------------- اجرای اصلی --------------------
+# -------------------- Main --------------------
 async def main():
-    application = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).build()
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & \
-                                           filters.COMMAND, handle_message))
-    application.add_handler(MessageHandler(filters.AUDIO, handle_audio))
-    application.add_handler(MessageHandler(filters.Document.AUDIO, handle_audio))
-    application.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & \
+                                   filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.AUDIO | filters.Document.AUDIO, handle_audio))
+    app.add_handler(CallbackQueryHandler(handle_callback))
 
     if ENV == "production" and WEBHOOK_URL:
-        await application.bot.set_webhook(WEBHOOK_URL)
-        await application.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=TOKEN,
-        )
+        await app.bot.set_webhook(WEBHOOK_URL)
+        await app.run_webhook(listen="0.0.0.0", port=PORT, url_path=TOKEN)
     else:
-        await application.run_polling()
+        await app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Bot stopped.")
+    except Exception as e:
+        logging.error(f"Critical error: {e}", exc_info=True)
