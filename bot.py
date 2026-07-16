@@ -10,7 +10,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 import lyricsgenius
 import requests
 from bs4 import BeautifulSoup
-from mutagen import File as MutagenFile  # برای خواندن متادیتا
+from mutagen import File as MutagenFile
 
 # -------------------- تنظیمات پایه --------------------
 logging.basicConfig(level=logging.INFO)
@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO)
 TOKEN = os.environ.get("TOKEN")
 GENIUS_TOKEN = os.environ.get("GENIUS_TOKEN")
 LASTFM_API_KEY = os.environ.get("LASTFM_API_KEY")
-ENV = os.environ.get("ENV", "development")  # production / development
+ENV = os.environ.get("ENV", "development")
 PORT = int(os.environ.get("PORT", 8443))
 
 if not TOKEN:
@@ -197,9 +197,8 @@ async def send_results_page(update_or_query, search_id, page):
     else:
         await update_or_query.edit_message_text(text, reply_markup=reply_markup, parse_mode=None)
 
-# -------------------- تابع جستجوی عمومی (برای استفاده در هر دو حالت) --------------------
+# -------------------- تابع جستجوی عمومی --------------------
 async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query_text: str):
-    """جستجو با متن ورودی و ارسال نتایج"""
     clean_old_cache()
     if not query_text:
         return
@@ -250,16 +249,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # پیام متنی
     query = update.message.text.strip()
     if query:
         await perform_search(update, context, query)
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """هندلر برای فایل‌های صوتی ارسال‌شده"""
     audio = update.message.audio
     if not audio:
-        # اگر به عنوان سند ارسال شده باشد
         document = update.message.document
         if document and document.mime_type and document.mime_type.startswith('audio/'):
             file_obj = document
@@ -271,57 +267,47 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_obj = audio
         file_name = audio.file_name or "audio.mp3"
 
-    # دانلود فایل موقت
     file_id = file_obj.file_id
     new_file = await context.bot.get_file(file_id)
     
-    # ایجاد فایل موقت با پسوند مناسب
     suffix = os.path.splitext(file_name)[1] or '.mp3'
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
         temp_path = temp_file.name
         await new_file.download_to_drive(temp_path)
 
     try:
-        # خواندن متادیتا با mutagen
         meta = MutagenFile(temp_path)
         title = None
         artist = None
 
         if meta and hasattr(meta, 'tags'):
-            # استخراج title و artist از تگ‌ها
             if 'TIT2' in meta.tags:
                 title = str(meta.tags['TIT2'])
             elif 'title' in meta.tags:
                 title = str(meta.tags['title'])
-            # برای هنرمند
             if 'TPE1' in meta.tags:
                 artist = str(meta.tags['TPE1'])
             elif 'artist' in meta.tags:
                 artist = str(meta.tags['artist'])
-            # برخی فایل‌ها ممکن است از TPE2 یا دیگر تگ‌ها استفاده کنند
             if not artist and 'TPE2' in meta.tags:
                 artist = str(meta.tags['TPE2'])
 
-        # اگر اطلاعاتی استخراج نشد، از نام فایل استفاده کن (بدون پسوند)
         if not title:
             title = os.path.splitext(file_name)[0]
         if not artist:
             artist = "Unknown Artist"
 
-        await update.message.reply_text(f"🎵 Extracted: **{title}** by **{artist}**", parse_mode=None)
-        # جستجو با عنوان و هنرمند
+        await update.message.reply_text(f"🎵 Extracted: {title} by {artist}", parse_mode=None)
         query_text = f"{title} {artist}"
         await perform_search(update, context, query_text)
 
     except Exception as e:
         logging.error(f"Audio metadata extraction error: {e}")
         await update.message.reply_text("⚠️ Could not read audio metadata. Trying with file name...", parse_mode=None)
-        # fallback: استفاده از نام فایل
         title = os.path.splitext(file_name)[0]
         await perform_search(update, context, title)
 
     finally:
-        # پاک کردن فایل موقت
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
@@ -389,7 +375,6 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    # هندلر برای فایل‌های صوتی (audio و document با mime type audio)
     application.add_handler(MessageHandler(filters.AUDIO, handle_audio))
     application.add_handler(MessageHandler(filters.Document.AUDIO, handle_audio))
     application.add_handler(CallbackQueryHandler(handle_callback))
